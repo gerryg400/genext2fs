@@ -144,6 +144,8 @@
 # include <limits.h>
 #endif
 
+#define MAX_PATH_LEN 1024
+
 struct stats {
 	unsigned long nblocks;
 	unsigned long ninodes;
@@ -613,6 +615,10 @@ struct hdlinks_s
 };
 
 static struct hdlinks_s hdlinks;
+
+#define MAX_SKIP 128
+static char * skip[MAX_SKIP];
+static int sidx = 0;
 
 static void
 swap_sb(superblock *sb)
@@ -1608,9 +1614,54 @@ add2fs_from_file(filesystem *fs, uint32 this_nod, FILE * fh, uint32 fs_timestamp
 		free(path2);
 }
 
+// changes directory and modifies curr_dir to reflect this
+static void
+chdir_path(char *curr_dir, const char *new_path)
+{
+	if(chdir(new_path) < 0)
+		perror_msg_and_die(new_path);
+	if(strlen(curr_dir) + strlen(new_path) + 1 >= MAX_PATH_LEN)
+		perror_msg_and_die("path too long");
+	strcat(curr_dir, "/");
+	strcat(curr_dir, new_path);
+}
+
+// changes to the parent directory and modifies curr_dir to reflect this
+static void
+chdir_parent(char *curr_dir)
+{
+	char *p;
+	if(chdir("..") < 0)
+		perror_msg_and_die("..");
+	p = curr_dir + strlen(curr_dir);
+	while (p > curr_dir)
+	{
+		--p;
+		if (*p == '/')
+		{
+			*p = 0;
+			return;
+		}
+	}
+}
+
+static int
+skip_path(const char *path_name)
+{
+	int i;
+	for(i=0; i<sidx; ++i)
+	{
+		if (!strcmp(skip[i], path_name))
+		{
+			return 1;
+		}
+	}
+	return 0;
+}
+
 // adds a tree of entries to the filesystem from current dir
 static void
-add2fs_from_dir(filesystem *fs, uint32 this_nod, int squash_uids, int squash_perms, uint32 fs_timestamp, struct stats *stats)
+add2fs_from_dir(filesystem *fs, uint32 this_nod, int squash_uids, int squash_perms, uint32 fs_timestamp, struct stats *stats, char *parent_name)
 {
 	uint32 nod;
 	uint32 uid, gid, mode, ctime, mtime;
@@ -1621,6 +1672,7 @@ add2fs_from_dir(filesystem *fs, uint32 this_nod, int squash_uids, int squash_per
 	struct stat st;
 	char *lnk;
 	uint32 save_nod;
+	int parent_name_len;
 
 	if(!(dh = opendir(".")))
 		perror_msg_and_die(".");
@@ -1654,10 +1706,10 @@ add2fs_from_dir(filesystem *fs, uint32 this_nod, int squash_uids, int squash_per
 					break;
 				case S_IFDIR:
 					stats->ninodes++;
-					if(chdir(dent->d_name) < 0)
-						perror_msg_and_die(dent->d_name);
-					add2fs_from_dir(fs, this_nod, squash_uids, squash_perms, fs_timestamp, stats);
-					chdir("..");
+					chdir_path(parent_name, dent->d_name);
+					if (!skip_path(parent_name))
+						add2fs_from_dir(fs, this_nod, squash_uids, squash_perms, fs_timestamp, stats, parent_name);
+					chdir_parent(parent_name);
 					break;
 				default:
 					break;
@@ -1703,10 +1755,10 @@ add2fs_from_dir(filesystem *fs, uint32 this_nod, int squash_uids, int squash_per
 					break;
 				case S_IFDIR:
 					nod = mkdir_fs(fs, this_nod, name, mode, uid, gid, ctime, mtime);
-					if(chdir(dent->d_name) < 0)
-						perror_msg_and_die(name);
-					add2fs_from_dir(fs, nod, squash_uids, squash_perms, fs_timestamp, stats);
-					chdir("..");
+					chdir_path(parent_name, dent->d_name);
+					if (!skip_path(parent_name))
+						add2fs_from_dir(fs, nod, squash_uids, squash_perms, fs_timestamp, stats, parent_name);
+					chdir_parent(parent_name);
 					break;
 				default:
 					error_msg("ignoring entry %s", name);
@@ -2373,6 +2425,8 @@ populate_fs(filesystem *fs, char **dopt, int didx, int squash_uids, int squash_p
 		int pdir;
 		char *pdest;
 		uint32 nod = EXT2_ROOT_INO;
+		char top_path_name[MAX_PATH_LEN];
+		top_path_name[0] = 0;
 		if(fs)
 			if((pdest = strchr(dopt[i], ':')))
 			{
@@ -2393,7 +2447,7 @@ populate_fs(filesystem *fs, char **dopt, int didx, int squash_uids, int squash_p
 					perror_msg_and_die(".");
 				if(chdir(dopt[i]) < 0)
 					perror_msg_and_die(dopt[i]);
-				add2fs_from_dir(fs, nod, squash_uids, squash_perms, fs_timestamp, stats);
+				add2fs_from_dir(fs, nod, squash_uids, squash_perms, fs_timestamp, stats, top_path_name);
 				if(fchdir(pdir) < 0)
 					perror_msg_and_die("fchdir");
 				if(close(pdir) < 0)
@@ -2418,6 +2472,7 @@ showhelp(void)
 	"Create an ext2 filesystem image from directories/files\n\n"
 	"  -x, --starting-image <image>\n"
 	"  -d, --root <directory>\n"
+	"  -s, --skip <directory>\n"
 	"  -D, --devtable <file>\n"
 	"  -b, --size-in-blocks <blocks>\n"
 	"  -i, --bytes-per-inode <bytes per inode>\n"
@@ -2475,6 +2530,7 @@ main(int argc, char **argv)
 	struct option longopts[] = {
 	  { "starting-image",	required_argument,	NULL, 'x' },
 	  { "root",		required_argument,	NULL, 'd' },
+	  { "skip directory",	required_argument,	NULL, 's' },
 	  { "devtable",		required_argument,	NULL, 'D' },
 	  { "size-in-blocks",	required_argument,	NULL, 'b' },
 	  { "bytes-per-inode",	required_argument,	NULL, 'i' },
@@ -2495,11 +2551,11 @@ main(int argc, char **argv)
 
 	app_name = argv[0];
 
-	while((c = getopt_long(argc, argv, "x:d:D:b:i:N:m:g:e:zfqUPhVv", longopts, NULL)) != EOF) {
+	while((c = getopt_long(argc, argv, "x:d:D:s:b:i:N:m:g:e:zfqUPhVv", longopts, NULL)) != EOF) {
 #else
 	app_name = argv[0];
 
-	while((c = getopt(argc, argv,      "x:d:D:b:i:N:m:g:e:zfqUPhVv")) != EOF) {
+	while((c = getopt(argc, argv,      "x:d:D:s:b:i:N:m:g:e:zfqUPhVv")) != EOF) {
 #endif /* HAVE_GETOPT_LONG */
 		switch(c)
 		{
@@ -2509,6 +2565,9 @@ main(int argc, char **argv)
 			case 'd':
 			case 'D':
 				dopt[didx++] = optarg;
+				break;
+			case 's':
+				skip[sidx++] = optarg;
 				break;
 			case 'b':
 				nbblocks = SI_atof(optarg);
